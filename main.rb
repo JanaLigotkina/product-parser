@@ -1,83 +1,130 @@
-require 'nokogiri'
+#!/usr/bin/env ruby
+
+require 'bundler/inline'
 require 'open-uri'
-require 'csv'
 
-def parse_category_page(url)
-  sleep(1)
-  open_url = URI.open(url)
-  final_url = open_url.base_uri.to_s
+gemfile do
+  source 'https://rubygems.org'
 
-  # Если финальный URL отличается от исходного, значит, было перенаправление
-  return nil if final_url != url
+  ruby '>= 3.0.0'
 
-  doc = Nokogiri::HTML(open_url)
-
-  products = []
-
-  # Ищем все товары на странице категории
-  doc.xpath('//div[contains(@class, "product-container")]').each do |product|
-    product_url = product.xpath('.//a[@class="product_img_link pro_img_hover_scale product-list-category-img"]/@href').text.strip
-    products.concat(parse_product_page(product_url))
-  end
-
-  products.empty? ? nil : products
+  gem 'csv'
+  gem 'nokogiri'
+  gem 'thor'
 end
 
-def parse_product_page(url)
-  doc = Nokogiri::HTML(URI.open(url))
+BASE_URL = 'https://www.petsonic.com/dermatitis-y-problemas-piel-para-perros/'.freeze
+CSV_FILENAME = 'pet_products.csv'.freeze
 
-  base_name = doc.xpath('//div[@itemtype="http://schema.org/Product"]/meta[@itemprop="name"]/@content').text
-  images = doc.xpath('//div[@itemtype="http://schema.org/Product"]/link[@itemprop="image"]/@href')
+PRODUCT_CONTAINER_XPATH = '//div[contains(@class, "product-container")]'.freeze
+PRODUCT_URL_XPATH = './/a[@class="product_img_link pro_img_hover_scale product-list-category-img"]/@href'.freeze
+BASE_NAME_XPATH = '//div[@itemtype="http://schema.org/Product"]/meta[@itemprop="name"]/@content'.freeze
+IMAGES_XPATH = '//div[@itemtype="http://schema.org/Product"]/link[@itemprop="image"]/@href'.freeze
+VARIANTS_XPATH = '//ul[@class="attribute_radio_list pundaline-variations"]/li'.freeze
+VARIANT_NAME_XPATH = './/span[@class="radio_label"]'.freeze
+PRICE_XPATH = './/span[@class="price_comb"]'.freeze
 
-  variants = []
+class Product
+  attr_accessor :name, :price, :image
 
-  # Ищем все варианты продукта на странице продукта
-  doc.xpath('//ul[@class="attribute_radio_list pundaline-variations"]/li').each do |variant|
-    variant_name = variant.xpath('.//span[@class="radio_label"]').text.strip
-    price = variant.xpath('.//span[@class="price_comb"]').text.strip
-    name = "#{base_name} - #{variant_name}"
-
-    # Добавляем изображение для каждого варианта продукта
-    variants << [name, price, images[0].text]
+  def initialize(name, price, image)
+    @name = name
+    @price = price
+    @image = image
   end
-
-  variants
 end
 
+class Category
+  attr_accessor :url, :products
 
-# Функция для записи данных в CSV файл
-def write_to_csv(data, filename, page_number)
-  CSV.open(filename, "a") do |csv|
-    # csv << ["Name", "Price", "Image"]
-    csv << ["Page number: #{page_number}"]
-    data.each do |row|
-      csv << row
+  def initialize(url)
+    @url = url
+    @products = []
+  end
+
+  def add_product(product)
+    @products << product
+  end
+end
+
+class Parser
+  def initialize
+    @page_number = 1
+  end
+
+  def parse_category_page(category)
+    category.products.clear
+    sleep(1)
+    open_url = URI.open(category.url)
+    final_url = open_url.base_uri.to_s
+
+    return nil if final_url != category.url
+    doc = Nokogiri::HTML(open_url)
+
+    doc.xpath(PRODUCT_CONTAINER_XPATH).each do |product|
+      product_url = product.xpath(PRODUCT_URL_XPATH).text.strip
+      parse_product_page(product_url).each do |product|
+        category.add_product(product)
+      end
+    end
+
+    category.products.empty? ? nil : category.products
+  end
+
+  def parse_product_page(url)
+    doc = Nokogiri::HTML(URI.open(url))
+
+    base_name = doc.xpath(BASE_NAME_XPATH).text
+    images = doc.xpath(IMAGES_XPATH)
+
+    variants = []
+
+    doc.xpath(VARIANTS_XPATH).each do |variant|
+      variant_name = variant.xpath(VARIANT_NAME_XPATH).text.strip
+      price = variant.xpath(PRICE_XPATH).text.strip
+      name = "#{base_name} - #{variant_name}"
+
+      variants << Product.new(name, price, images[0].text)
+    end
+
+    variants
+  end
+
+  def write_to_csv(category, filename)
+    CSV.open(filename, 'a') do |csv|
+      category.products.each do |product|
+        csv << [product.name, product.price, product.image]
+      end
+    end
+  end
+
+  def record(category_url, filename)
+    category = Category.new(category_url)
+
+    loop do
+      break if parse_category_page(category).nil?
+
+      write_to_csv(category, filename)
+
+      @page_number += 1
+      category.url = "#{category_url}?p=#{@page_number}"
     end
   end
 end
 
-def process_category(category_url, filename)
-  page_number = 1
+class ProductParserCLI < Thor
+  # Example start:
+  # ruby main.rb record "https://www.petsonic.com/dermatitis-y-problemas-piel-para-perros/" "pet_products.csv"
+  desc 'record URL FILENAME', 'Process a category page and write the results to a file'
+  def record(url, filename)
+    parser = Parser.new
 
-  loop do
-    all_products = parse_category_page(category_url)
+    CSV.open(filename, 'wb') do |csv|
+      csv << %w[Name Price Image]
+    end
 
-    # Если на странице нет продуктов, значит, мы достигли конца пагинации
-    break if all_products.nil?
-
-    write_to_csv(all_products, filename, page_number)
-
-    # Обработка пагинации
-    page_number += 1
-    category_url = "https://www.petsonic.com/dermatitis-y-problemas-piel-para-perros/?p=#{page_number}"
+    parser.record(url, filename)
   end
 end
 
-# Пример запуска скрипта
-# Сначала создаем заголовок CSV файла
-CSV.open("pet_products.csv", "wb") do |csv|
-  csv << ["Name", "Price", "Image"]
-end
-
-# Затем обрабатываем категорию и записываем данные в CSV файл
-process_category("https://www.petsonic.com/dermatitis-y-problemas-piel-para-perros/", "pet_products.csv")
+ProductParserCLI.start(ARGV)
