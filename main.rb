@@ -3,6 +3,7 @@
 require 'bundler/inline'
 require 'open-uri'
 require 'open3'
+require 'ruby-progressbar'
 
 gemfile do
   source 'https://rubygems.org'
@@ -11,10 +12,11 @@ gemfile do
 
   gem 'csv'
   gem 'nokogiri'
-  gem 'pastel'
+  gem 'rainbow'
   gem 'thor'
 end
 
+Product = Struct.new(:name, :price, :image)
 module Xpath
   PRODUCT_CONTAINER_XPATH = '//div[contains(@class, "product-container")]'.freeze
   PRODUCT_URL_XPATH = './/a[@class="product_img_link pro_img_hover_scale product-list-category-img"]/@href'.freeze
@@ -25,23 +27,7 @@ module Xpath
   PRICE_XPATH = './/span[@class="price_comb"]'.freeze
 end
 
-module ColorfulOutput
-  def pastel
-    @pastel ||= Pastel.new
-  end
-end
-
-class Product
-  attr_accessor :name, :price, :image
-
-  def initialize(name, price, image)
-    @name = name
-    @price = price
-    @image = image
-  end
-end
-
-class Category
+class ProductList
   attr_accessor :url, :products
 
   def initialize(url)
@@ -54,31 +40,59 @@ class Category
   end
 end
 
-class CategoryPageParser
+class ProductListPageParser
   include Xpath
 
+  attr_reader :page_number
   def initialize(product_page_parser)
     @product_page_parser = product_page_parser
     @page_number = 1
   end
 
-  def parse(category)
-    category.products.clear
-    sleep(1)
-    open_url = URI.open(category.url)
+  def parse(product_list)
+    product_list.products.clear
+    doc = fetch_page(product_list)
+
+    return nil if doc.nil?
+
+    parse_products(doc, product_list)
+    increment_page_number
+    products_empty?(product_list)
+  end
+
+  private
+
+  def fetch_page(product_list)
+    open_url = URI.open(product_list.url)
     final_url = open_url.base_uri.to_s
 
-    return nil if final_url != category.url
-    doc = Nokogiri::HTML(open_url)
+    return nil if final_url != product_list.url
 
-    doc.xpath(PRODUCT_CONTAINER_XPATH).each do |product|
+    Nokogiri::HTML(open_url)
+  end
+
+  def parse_products(doc, product_list)
+    products = doc.xpath(PRODUCT_CONTAINER_XPATH)
+    progressbar = ProgressBar.create(total: products.size, format: '%a %bᗧ%i %p%% %t')
+
+    products.each do |product|
       product_url = product.xpath(PRODUCT_URL_XPATH).text.strip
       @product_page_parser.parse(product_url).each do |product|
-        category.add_product(product)
+        product_list.add_product(product)
       end
+      progressbar.increment
     end
 
-    category.products.empty? ? nil : category.products
+    stdout, status = Open3.capture2('echo', "Products from page №#{@page_number} are recorded")
+    puts Rainbow(stdout).aqua if status.success?
+  end
+
+  def increment_page_number
+    @page_number += 1
+  end
+
+  def products_empty?(product_list)
+    product_list.products.empty? ? nil : product_list.products
   end
 end
 
@@ -105,32 +119,42 @@ class ProductPageParser
   end
 end
 
-class CsvWriter
-  def write(category, filename)
+class FileWriter
+  def initialize(filename)
+    @filename = filename
+  end
+  def write(product_list, filename)
+    create_file unless File.exist?(filename)
+
     CSV.open(filename, 'a') do |csv|
-      category.products.each do |product|
+      product_list.products.each do |product|
         csv << [product.name, product.price, product.image]
       end
+    end
+  end
+
+  private
+
+  def create_file
+    CSV.open(@filename, 'wb') do |csv|
+      csv << %w[Name Price Image]
     end
   end
 end
 
 class Parser
-  def initialize(category_page_parser, product_page_parser, csv_writer)
-    @category_page_parser = category_page_parser
-    @product_page_parser = product_page_parser
-    @csv_writer = csv_writer
-    @page_number = 1
+  def initialize(product_list_parser, file_writer)
+    @product_list_parser = product_list_parser
+    @file_writer = file_writer
   end
 
-  def record_to_file(category, category_url, filename)
+  def record_to_file(product_list, category_url, filename)
     loop do
-      break if @category_page_parser.parse(category).nil?
+      break if @product_list_parser.parse(product_list).nil?
 
-      @csv_writer.write(category, filename)
+      @file_writer.write(product_list, filename)
 
-      @page_number += 1
-      category.url = "#{category_url}?p=#{@page_number}"
+      product_list.url = "#{category_url}?p=#{@product_list_parser.page_number}"
     end
   end
 end
@@ -138,29 +162,20 @@ end
 class ProductParserCLI < Thor
   # Example start:
   # ruby main.rb record "https://www.petsonic.com/dermatitis-y-problemas-piel-para-perros/" "pet_products.csv"
-  include ColorfulOutput
   desc 'record URL FILENAME', 'Process a category page and write the results to a file'
   def record(url, filename)
-    say pastel.yellow("Picking up products from: `#{url}`")
-    say pastel.yellow("Creating a file with the name `#{filename}`")
+    say Rainbow("Picking up products from: `#{url}`").aqua
+    say Rainbow("Creating a file with the name `#{filename}`").aqua
 
-    create_file(filename)
-    category = Category.new(url)
+    product_list = ProductList.new(url)
     product_page_parser = ProductPageParser.new
-    category_page_parser = CategoryPageParser.new(product_page_parser)
-    csv_writer = CsvWriter.new
-    parser = Parser.new(category_page_parser, product_page_parser, csv_writer)
-    parser.record_to_file(category, url, filename)
+    product_list_parser = ProductListPageParser.new(product_page_parser)
+    file_writer = FileWriter.new(filename)
 
-    say pastel.bold.green('Done!')
-  end
+    parser = Parser.new(product_list_parser, file_writer)
+    parser.record_to_file(product_list, url, filename)
 
-  private
-
-  def create_file(filename)
-    CSV.open(filename, 'wb') do |csv|
-      csv << %w[Name Price Image]
-    end
+    say Rainbow("Done! All products added. Check the file for the results `#{filename}`").green
   end
 end
 
