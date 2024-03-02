@@ -1,6 +1,7 @@
 ## Products Parser
 
 ### Description
+Test task. 
 This is a simple parser that extracts products from a given URL and saves them to a CSV file.
 The parser saves all products, including multi-products.
 
